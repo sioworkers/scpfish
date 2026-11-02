@@ -305,6 +305,9 @@ struct DirtyPiece {
     // castling uses add_sq and remove_sq to remove and add the rook
     Square remove_sq, add_sq;
     Piece  remove_pc, add_pc;
+
+    // SCP-096 took a piece after this move: the accumulator must be refreshed
+    bool scpCapture;
 };
 
 // Keep track of what threats change on the board (used by NNUE)

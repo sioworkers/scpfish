@@ -78,6 +78,13 @@ Value scale_evaluation(Value nnue, int optimism, const Position& pos) {
     // Damp down the evaluation linearly when shuffling
     v -= v * pos.rule50_count() / 189;
 
+    // SCP-096 acts after Black's move. With Black to move, a White piece the SCP
+    // is about to take is as good as gone: Black cannot save it for White.
+    if (pos.scp_bb() && pos.side_to_move() == BLACK)
+        if (Square sq = pos.scp_victim(); sq != SQ_NONE)
+            if (Piece pc = pos.piece_on(sq); color_of(pc) == WHITE && type_of(pc) != KING)
+                v += PieceValue[pc];
+
     // Guarantee that the evaluation does not hit the tablebase range
     v = std::clamp(v, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
 

@@ -1908,7 +1908,8 @@ Config Tablebases::rank_root_moves(const OptionsMap&            options,
                                    const std::function<bool()>& time_abort) {
     Config config;
 
-    if (rootMoves.empty())
+    // Tablebases know nothing about SCP-096
+    if (rootMoves.empty() || pos.scp_bb())
         return config;
 
     config.rootInTB    = false;

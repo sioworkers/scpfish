@@ -36,6 +36,10 @@ u64 perft(Position& pos, Depth depth) {
 
     StateInfo st;
 
+    // The game ended because SCP-096 took a king
+    if (pos.scp_outcome())
+        return 0;
+
     u64        cnt, nodes = 0;
     const bool leaf = (depth == 2);
 
@@ -46,7 +50,8 @@ u64 perft(Position& pos, Depth depth) {
         else
         {
             pos.do_move(m, st);
-            cnt = leaf ? MoveList<ALL>(pos).size() : perft<false>(pos, depth - 1);
+            cnt = leaf ? (pos.scp_outcome() ? 0 : MoveList<ALL>(pos).size())
+                       : perft<false>(pos, depth - 1);
             nodes += cnt;
             pos.undo_move(m);
         }

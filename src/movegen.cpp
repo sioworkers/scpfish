@@ -115,8 +115,9 @@ Move* generate_pawn_moves(const Position& pos, Move* moveList, Bitboard target) 
     constexpr Direction UpRight  = (Us == WHITE ? NORTH_EAST : SOUTH_WEST);
     constexpr Direction UpLeft   = (Us == WHITE ? NORTH_WEST : SOUTH_EAST);
 
-    const Bitboard emptySquares = ~pos.pieces();
-    const Bitboard enemies      = Type == EVASIONS ? pos.checkers() : pos.pieces(Them);
+    const Bitboard emptySquares = ~pos.blockers();  // SCP-096 blocks pawn pushes
+    const Bitboard enemies =
+      Type == EVASIONS ? pos.checkers() & pos.pieces(Them) : pos.pieces(Them);
     const Bitboard pinned       = pos.blockers_for_king(Us);
     const Square   ksq          = pos.square<KING>(Us);
 
@@ -205,7 +206,7 @@ Move* generate_moves(const Position& pos, Move* moveList, Bitboard target, Color
     while (bb)
     {
         Square   from = pop_lsb(bb);
-        Bitboard b    = Attacks::attacks_bb(Pt, from, pos.pieces()) & target;
+        Bitboard b    = Attacks::attacks_bb(Pt, from, pos.blockers()) & target;
 
         moveList = splat_moves(moveList, from, b);
     }
@@ -216,7 +217,7 @@ Move* generate_moves(const Position& pos, Move* moveList, Bitboard target, Color
         while (bb)
         {
             Square   from = pop_lsb(bb);
-            Bitboard b    = Attacks::attacks_bb(Pt, from, pos.pieces()) & target;
+            Bitboard b    = Attacks::attacks_bb(Pt, from, pos.blockers()) & target;
             b &= Attacks::line_bb(ksq, from);
 
             moveList = splat_moves(moveList, from, b);
@@ -238,9 +239,10 @@ Move* generate_all(const Position& pos, Move* moveList, Color us) {
     // Skip generating non-king moves when in double check
     if (Type != EVASIONS || !more_than_one(pos.checkers()))
     {
-        target = Type == EVASIONS ? Attacks::between_bb(ksq, lsb(pos.checkers()))
+        // When SCP-096 is the checker nothing can capture it or block it
+        target = Type == EVASIONS ? Attacks::between_bb(ksq, lsb(pos.checkers())) & ~pos.scp_bb()
                : Type == CAPTURES ? pos.pieces(~us)
-                                  : ~pos.pieces();  // QUIETS
+                                  : ~pos.blockers();  // QUIETS
 
         moveList = us == WHITE ? generate_pawn_moves<WHITE, Type>(pos, moveList, target)
                                : generate_pawn_moves<BLACK, Type>(pos, moveList, target);
@@ -253,12 +255,15 @@ Move* generate_all(const Position& pos, Move* moveList, Color us) {
     if constexpr (Type == EVASIONS)
         target = ~pos.pieces(us);
 
-    target &= ~pos.threats_by(ALL_PIECES);
+    // The king may not stand a knight's move away from SCP-096 (nor on it)
+    target &= ~(pos.threats_by(ALL_PIECES) | pos.scp_king_forbidden());
 
     Bitboard b = Attacks::attacks_bb(KING, ksq) & target;
     moveList   = splat_moves(moveList, ksq, b);
 
-    if (Type == QUIETS && pos.can_castle(us & ANY_CASTLING))
+    // Castling is still allowed when the only "checker" is SCP-096
+    if ((Type == QUIETS || (Type == EVASIONS && pos.checkers() == pos.scp_bb()))
+        && pos.can_castle(us & ANY_CASTLING))
     {
         for (CastlingRights cr : {us & KING_SIDE, us & QUEEN_SIDE})
         {
@@ -267,6 +272,7 @@ Move* generate_all(const Position& pos, Move* moveList, Color us) {
 
             if (!pos.castling_impeded(cr) && pos.can_castle(cr)
                 && !(Attacks::between_bb(ksq, to) & pos.threats_by(ALL_PIECES))
+                && !(pos.scp_king_forbidden() & to)
                 && !(pos.blockers_for_king(us) & rookSquare))
                 *moveList++ = Move::make<CASTLING>(ksq, rookSquare);
         }

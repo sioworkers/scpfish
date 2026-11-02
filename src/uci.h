@@ -35,7 +35,8 @@ class Score;
 enum Square : u8;
 using Value = int;
 
-constexpr auto StartFEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+// SCP-096 starts on a4
+constexpr auto StartFEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1 scp:a4";
 
 class UCIEngine {
    public:

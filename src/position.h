@@ -54,6 +54,12 @@ struct StateInfo {
     int    pliesFromNull;
     Square epSquare;
 
+    // SCP-096: square occupied by the SCP (empty bitboard if there is none) and
+    // the squares a king may not stand on (the SCP square plus every square a
+    // knight's move away from it).
+    Bitboard scpBB;
+    Bitboard scpKingForbidden;
+
     // Not copied when making a move (will be recomputed anyhow)
     Key        key;
     Bitboard   checkersBB;
@@ -64,6 +70,16 @@ struct StateInfo {
     Bitboard   threats[PIECE_TYPE_NB];
     Piece      capturedPiece;
     int        repetition;
+    int        scpOutcome;     // SCP_NONE, or game result for the side to move
+    Piece      scpCaptured;    // piece taken by SCP-096 after this move, if any
+    Square     scpCapturedSq;  // and where it stood
+};
+
+// Result of the SCP-096 acting on the board, from the side to move's view
+enum ScpOutcome : int {
+    SCP_NONE = 0,
+    SCP_WIN  = 1,   // the opponent's king was taken (or can be taken right away)
+    SCP_LOSS = -1,  // our king was taken by the SCP
 };
 
 
@@ -97,7 +113,8 @@ class Position {
     std::string                     fen() const;
 
     // Position representation
-    Bitboard pieces() const;  // All pieces
+    Bitboard pieces() const;    // All pieces
+    Bitboard blockers() const;  // All pieces plus the SCP-096 square
     template<typename... PieceTypes>
     Bitboard pieces(PieceTypes... pts) const;
     Bitboard pieces(Color c) const;
@@ -118,6 +135,13 @@ class Position {
     bool   can_castle(CastlingRights cr) const;
     bool   castling_impeded(CastlingRights cr) const;
     Square castling_rook_square(CastlingRights cr) const;
+
+    // SCP-096
+    Bitboard scp_bb() const;
+    Square   scp_square() const;
+    Bitboard scp_king_forbidden() const;
+    Square   scp_victim() const;
+    int      scp_outcome() const;
 
     // Checking
     Bitboard checkers() const;
@@ -212,6 +236,9 @@ class Position {
                      DirtyPiece* const   dp  = nullptr);
     template<bool AfterMove = false>
     Key adjust_key50(Key k) const;
+    void set_scp(Square s);
+    void scp_act(DirtyPiece& dp);
+    void validate_ep_after_scp();
 
     // Data members
     std::array<Piece, SQUARE_NB>        board;
@@ -245,6 +272,16 @@ inline bool Position::empty(Square s) const { return piece_on(s) == NO_PIECE; }
 inline Piece Position::moved_piece(Move m) const { return piece_on(m.from_sq()); }
 
 inline Bitboard Position::pieces() const { return byTypeBB[ALL_PIECES]; }
+
+inline Bitboard Position::blockers() const { return byTypeBB[ALL_PIECES] | st->scpBB; }
+
+inline Bitboard Position::scp_bb() const { return st->scpBB; }
+
+inline Square Position::scp_square() const { return st->scpBB ? lsb(st->scpBB) : SQ_NONE; }
+
+inline Bitboard Position::scp_king_forbidden() const { return st->scpKingForbidden; }
+
+inline int Position::scp_outcome() const { return st->scpOutcome; }
 
 template<typename... PieceTypes>
 inline Bitboard Position::pieces(PieceTypes... pts) const {
@@ -280,7 +317,7 @@ inline bool Position::can_castle(CastlingRights cr) const { return st->castlingR
 
 inline bool Position::castling_impeded(CastlingRights cr) const {
     assert(cr == WHITE_OO || cr == WHITE_OOO || cr == BLACK_OO || cr == BLACK_OOO);
-    return pieces() & castlingPath[cr];
+    return blockers() & castlingPath[cr];
 }
 
 inline Square Position::castling_rook_square(CastlingRights cr) const {
@@ -288,7 +325,7 @@ inline Square Position::castling_rook_square(CastlingRights cr) const {
     return castlingRookSquare[cr];
 }
 
-inline Bitboard Position::attackers_to(Square s) const { return attackers_to(s, pieces()); }
+inline Bitboard Position::attackers_to(Square s) const { return attackers_to(s, blockers()); }
 
 // includes X-ray attacks through the king of color ~c
 inline Bitboard Position::xattacks_by(PieceType pt, Color c, Bitboard occupied) const {

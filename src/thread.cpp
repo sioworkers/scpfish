@@ -313,7 +313,8 @@ void ThreadPool::start_thinking(const OptionsMap&  options,
             rootMoves.emplace_back(move);
     }
 
-    if (rootMoves.empty())
+    // No moves once SCP-096 has ended the game by taking a king
+    if (rootMoves.empty() && !pos.scp_outcome())
         for (const auto& m : MoveList<ALL>(pos))
             rootMoves.emplace_back(m);
 

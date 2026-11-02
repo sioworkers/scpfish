@@ -131,7 +131,7 @@ bool K32H3::requires_refresh(const DiffType&   diff,
                              Color             perspective,
                              const BlockState& before,
                              const BlockState& after) {
-    return diff.pc == make_piece(perspective, KING)
+    return diff.scpCapture || diff.pc == make_piece(perspective, KING)
         || block(before, perspective) != block(after, perspective);
 }
 

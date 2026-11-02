@@ -804,6 +804,10 @@ Value Search::Worker::search(
 
     if (!rootNode)
     {
+        // SCP-096 took a king: the game is over
+        if (pos.scp_outcome())
+            return pos.scp_outcome() > 0 ? mate_in(ss->ply) : mated_in(ss->ply);
+
         // Step 2. Check for aborted search or immediate draw
         if (threads.stop.load(std::memory_order_relaxed) || pos.is_draw(ss->ply)
             || ss->ply >= MAX_PLY)
@@ -1727,6 +1731,10 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
     if (PvNode && selDepth < ss->ply + 1)
         selDepth = ss->ply + 1;
 
+    // SCP-096 took a king: the game is over
+    if (pos.scp_outcome())
+        return pos.scp_outcome() > 0 ? mate_in(ss->ply) : mated_in(ss->ply);
+
     // Step 2. Check for an immediate draw or maximum ply reached
     if (pos.is_draw(ss->ply) || ss->ply >= MAX_PLY)
         return (ss->ply >= MAX_PLY && !ss->inCheck) ? evaluate(pos) : VALUE_DRAW;
@@ -1896,7 +1904,7 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
 
         // Only check for stalemate under specific conditions
         Color us = pos.side_to_move();
-        if (!(pawn_single_push_bb(us, pos.pieces(us, PAWN)) & ~pos.pieces())
+        if (!(pawn_single_push_bb(us, pos.pieces(us, PAWN)) & ~pos.blockers())
             && !pos.non_pawn_material(us) && type_of(pos.captured_piece()) >= KNIGHT
             && !MoveList<ALL>(pos).size())
             bestValue = VALUE_DRAW;
