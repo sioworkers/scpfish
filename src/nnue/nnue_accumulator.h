@@ -95,7 +95,8 @@ struct AccumulatorState: public Accumulator, Dirties {
 
 class AccumulatorStack {
    public:
-    static constexpr usize MaxSize = MAX_PLY + 1;
+    // One entry per ply, plus one per SCP-049 turn (at most every other ply)
+    static constexpr usize MaxSize = 2 * MAX_PLY + 2;
 
     [[nodiscard]] const AccumulatorState& latest() const noexcept;
 

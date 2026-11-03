@@ -361,6 +361,17 @@ class Worker {
     template<NodeType nodeType>
     Value qsearch(Position& pos, Stack* ss, Value alpha, Value beta);
 
+    // Chance node for SCP-049's turn
+    template<NodeType nodeType>
+    Value scp049_chance(
+      Position& pos, Stack* ss, Value alpha, Value beta, Depth depth, bool cutNode, bool qsearchNode);
+
+    // Set from the SCP options
+    Color rootColor  = WHITE;
+    int   scpRisk    = 0;  // -100 worst case .. 100 best case
+    int   scpSamples = 1;  // zombie samples per SCP step
+    bool  scpLookahead = true;  // false: ignore SCP-049's turn
+
     int reduction(bool i, Depth d, int mn) const;
 
     // Pointer to the search manager, only allowed to be called by the main thread

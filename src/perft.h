@@ -36,7 +36,7 @@ u64 perft(Position& pos, Depth depth) {
 
     StateInfo st;
 
-    // The game ended because SCP-096 took a king
+    // Game decided by an SCP or a capturable king
     if (pos.scp_outcome())
         return 0;
 

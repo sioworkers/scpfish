@@ -163,7 +163,8 @@ Option& Option::operator=(const std::string& v) {
         std::string        token;
         std::istringstream ss(defaultValue);
         while (ss >> token)
-            comboMap.add(token, Option());
+            if (!comboMap.count(token))  // "var" and the default appear more than once
+                comboMap.add(token, Option());
         if (!comboMap.count(v) || v == "var")
             return *this;
     }

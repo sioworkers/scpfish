@@ -216,6 +216,17 @@ void Search::Worker::start_searching() {
     tt.new_search();
     main_manager()->updates.onStart();
 
+    // SCP-049: capture the king the opponent left en prise
+    if (rootMoves.empty() && rootPos.scp_type() == SCP_049 && rootPos.can_capture_king())
+    {
+        const Square ksq  = rootPos.square<KING>(~rootPos.side_to_move());
+        const Square from = lsb(rootPos.attackers_to(ksq, rootPos.blockers())
+                                & rootPos.pieces(rootPos.side_to_move()) & ~rootPos.zombies());
+        main_manager()->updates.onUpdateNoMoves({0, {VALUE_MATE - 1, rootPos}});
+        main_manager()->updates.onBestmove(UCIEngine::move(Move(from, ksq), false), "");
+        return;
+    }
+
     if (rootMoves.empty())
     {
         main_manager()->updates.onUpdateNoMoves(
@@ -292,6 +303,11 @@ bool Search::Worker::iterative_deepening() {
     Value  alpha, beta;
     Value  bestValue     = -VALUE_INFINITE;
     Color  us            = rootPos.side_to_move();
+
+    rootColor  = us;
+    scpRisk    = int(options["SCP Risk"]);
+    scpSamples = int(options["SCP Samples"]);
+    scpLookahead = bool(int(options["SCP-049 Lookahead"]));
     double timeReduction = 1, totBestMoveChanges = 0;
     int    delta, iterIdx                        = 0;
 
@@ -710,6 +726,112 @@ void Search::Worker::undo_move(Position& pos, const Move move) {
 void Search::Worker::undo_null_move(Position& pos) { pos.undo_null_move(); }
 
 
+// Chance node for SCP-049's turn. Each SCP step is searched; zombie moves, which
+// have too many combinations, are sampled scpSamples times per step, with the
+// probability of a zombie capturing a king accounted exactly. The results are
+// averaged, or blended towards the worst (SCP Risk -100) or best (100) outcome
+// for the root side.
+template<NodeType nodeType>
+Value Search::Worker::scp049_chance(
+  Position& pos, Stack* ss, Value alpha, Value beta, Depth depth, bool cutNode, bool qsearchNode) {
+
+    constexpr NodeType NT     = nodeType == Root ? PV : nodeType;
+    constexpr bool     PvNode = NT == PV;
+    constexpr Value    K      = VALUE_TB_WIN_IN_MAX_PLY - 1;  // a certain king capture, below mate scores
+
+    // Lookahead off: search as if the SCP did nothing
+    if (!scpLookahead)
+    {
+        StateInfo st;
+        pos.skip_scp049_phase(st);
+        const Value v = qsearchNode ? qsearch<NT>(pos, ss, alpha, beta)
+                                    : search<NT>(pos, ss, alpha, beta, depth, cutNode);
+        pos.undo_skip_scp049_phase();
+        return v;
+    }
+
+    Square    dests[4];
+    const int nDirs   = std::max(pos.scp049_destinations(dests), 1);
+    const int nScen   = nDirs * std::max(scpSamples, 1);
+    const Color us    = pos.side_to_move();
+    const int   sign  = us == rootColor ? 1 : -1;  // side to move -> root
+
+    double expected = 0, worst = K, best = -K;  // root's point of view
+    Value  minV = VALUE_INFINITE, maxV = -VALUE_INFINITE;  // side to move's view
+    bool   allWins = true, allLosses = true;
+
+    for (int i = 0; i < nScen; ++i)
+    {
+        const int dir  = i % nDirs;
+        const u64 seed = pos.key() ^ (u64(dir + 1) * 0x9E3779B97F4A7C15ULL)
+                       ^ (u64(i / nDirs + 1) * 0xC2B2AE3D27D4EB4FULL);
+
+        StateInfo      st;
+        ScpPhaseUndo   undo;
+        ScpPhaseResult res;
+        Dirties&       dirties = accumulatorStack.push(pos);
+        pos.do_scp049_phase(nDirs > 1 || pos.scp049_destinations(dests) ? dir : -1, seed, true, st,
+                            undo, dirties.dirtyPiece, res);
+        ++nodes;
+
+        // Value of this scenario for the side to move
+        const double lossP = res.pKingLoss[us], winP = res.pKingLoss[~us];
+        Value        v;
+
+        if (res.survive <= 0)
+            v = lossP >= 1 ? mated_in(ss->ply) : winP >= 1 ? mate_in(ss->ply) : Value((winP - lossP) * K);
+        else if (lossP == 0 && winP == 0)
+            v = qsearchNode ? qsearch<NT>(pos, ss, alpha, beta)
+                            : search<NT>(pos, ss, alpha, beta, depth, cutNode);
+        else
+        {
+            // v = c + survive * child, so scale the window accordingly
+            const double c  = (winP - lossP) * K;
+            const double sv = res.survive;
+            auto toChild = [&](Value x) {
+                return Value(std::clamp((x - c) / sv, double(-VALUE_INFINITE + 1), double(VALUE_INFINITE - 1)));
+            };
+            Value a = toChild(alpha), b = PvNode ? std::max(toChild(beta), Value(a + 1)) : Value(a + 1);
+            a = std::min(a, Value(VALUE_INFINITE - 2));
+            b = std::min(b, Value(VALUE_INFINITE - 1));
+            Value child = qsearchNode ? qsearch<NT>(pos, ss, a, b)
+                                      : search<NT>(pos, ss, a, b, depth, cutNode);
+            child = std::clamp(child, Value(-K), K);
+            v     = Value(c + sv * child);
+        }
+
+        pos.undo_scp049_phase(undo);
+        accumulatorStack.pop();
+
+        if (threads.stop.load(std::memory_order_relaxed))
+            return VALUE_ZERO;
+
+        allWins   = allWins && is_win(v);
+        allLosses = allLosses && is_loss(v);
+        minV      = std::min(minV, v);
+        maxV      = std::max(maxV, v);
+
+        // Root's point of view, mates clamped to K
+        const double r = sign * std::clamp(v, Value(-K), K);
+        expected += r / nScen;
+        // Any chance of losing (winning) a king is the worst (best) case
+        const double rootLoss = sign > 0 ? lossP : winP, rootWin = sign > 0 ? winP : lossP;
+        worst = std::min(worst, rootLoss > 0 ? -double(K) : r);
+        best  = std::max(best, rootWin > 0 ? double(K) : r);
+    }
+
+    // Keep exact mate scores when every outcome agrees
+    if (allWins || allLosses)
+        return minV;
+
+    const double rho   = scpRisk / 100.0;
+    const double value = rho < 0 ? expected + (-rho) * (worst - expected)
+                                 : expected + rho * (best - expected);
+
+    return std::clamp(Value(sign * value), Value(-K), K);
+}
+
+
 // Reset histories, usually before a new game
 void Search::Worker::clear() {
     mainHistory.fill(-5);
@@ -749,6 +871,10 @@ Value Search::Worker::search(
     // Dive into quiescence search when the depth reaches zero
     if (depth <= 0)
         return qsearch<PvNode ? PV : NonPV>(pos, ss, alpha, beta);
+
+    // SCP-049's turn is pending
+    if (!rootNode && pos.phase_pending())
+        return scp049_chance<nodeType>(pos, ss, alpha, beta, depth, cutNode, false);
 
     // Limit the depth if extensions made it too large
     depth = std::min(depth, MAX_PLY - 1);
@@ -804,7 +930,7 @@ Value Search::Worker::search(
 
     if (!rootNode)
     {
-        // SCP-096 took a king: the game is over
+        // Game decided by an SCP or a capturable king
         if (pos.scp_outcome())
             return pos.scp_outcome() > 0 ? mate_in(ss->ply) : mated_in(ss->ply);
 
@@ -1699,6 +1825,10 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
     assert(alpha >= -VALUE_INFINITE && alpha < beta && beta <= VALUE_INFINITE);
     assert(PvNode || (alpha == beta - 1));
 
+    // SCP-049's turn is pending
+    if (pos.phase_pending())
+        return scp049_chance<nodeType>(pos, ss, alpha, beta, 0, false, true);
+
     // Check if we have an upcoming move that draws by repetition
     if (alpha < VALUE_DRAW && pos.upcoming_repetition(ss->ply))
     {
@@ -1731,7 +1861,7 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
     if (PvNode && selDepth < ss->ply + 1)
         selDepth = ss->ply + 1;
 
-    // SCP-096 took a king: the game is over
+    // Game decided by an SCP or a capturable king
     if (pos.scp_outcome())
         return pos.scp_outcome() > 0 ? mate_in(ss->ply) : mated_in(ss->ply);
 

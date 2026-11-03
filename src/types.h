@@ -306,7 +306,7 @@ struct DirtyPiece {
     Square remove_sq, add_sq;
     Piece  remove_pc, add_pc;
 
-    // SCP-096 took a piece after this move: the accumulator must be refreshed
+    // An SCP changed the board: the accumulator must be refreshed
     bool scpCapture;
 };
 

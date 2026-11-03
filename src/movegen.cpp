@@ -115,7 +115,7 @@ Move* generate_pawn_moves(const Position& pos, Move* moveList, Bitboard target) 
     constexpr Direction UpRight  = (Us == WHITE ? NORTH_EAST : SOUTH_WEST);
     constexpr Direction UpLeft   = (Us == WHITE ? NORTH_WEST : SOUTH_EAST);
 
-    const Bitboard emptySquares = ~pos.blockers();  // SCP-096 blocks pawn pushes
+    const Bitboard emptySquares = ~pos.blockers();
     const Bitboard enemies =
       Type == EVASIONS ? pos.checkers() & pos.pieces(Them) : pos.pieces(Them);
     const Bitboard pinned       = pos.blockers_for_king(Us);
@@ -239,7 +239,7 @@ Move* generate_all(const Position& pos, Move* moveList, Color us) {
     // Skip generating non-king moves when in double check
     if (Type != EVASIONS || !more_than_one(pos.checkers()))
     {
-        // When SCP-096 is the checker nothing can capture it or block it
+        // An SCP-096 check can only be evaded by a king move
         target = Type == EVASIONS ? Attacks::between_bb(ksq, lsb(pos.checkers())) & ~pos.scp_bb()
                : Type == CAPTURES ? pos.pieces(~us)
                                   : ~pos.blockers();  // QUIETS
@@ -255,13 +255,13 @@ Move* generate_all(const Position& pos, Move* moveList, Color us) {
     if constexpr (Type == EVASIONS)
         target = ~pos.pieces(us);
 
-    // The king may not stand a knight's move away from SCP-096 (nor on it)
+    // Kings may not stand on or a knight's move from SCP-096
     target &= ~(pos.threats_by(ALL_PIECES) | pos.scp_king_forbidden());
 
     Bitboard b = Attacks::attacks_bb(KING, ksq) & target;
     moveList   = splat_moves(moveList, ksq, b);
 
-    // Castling is still allowed when the only "checker" is SCP-096
+    // Castling is allowed when SCP-096 is the only checker
     if ((Type == QUIETS || (Type == EVASIONS && pos.checkers() == pos.scp_bb()))
         && pos.can_castle(us & ANY_CASTLING))
     {
@@ -281,6 +281,103 @@ Move* generate_all(const Position& pos, Move* moveList, Color us) {
     return moveList;
 }
 
+
+// Generates pseudo-legal moves under SCP-049 rules. There is no check, zombies
+// neither move nor can be captured, and king captures are not generated (a
+// position where one is available is scored as won). EVASIONS generates all moves.
+template<GenType Type>
+Move* generate_049(const Position& pos, Move* moveList) {
+
+    constexpr bool Caps   = Type == CAPTURES || Type == EVASIONS;
+    constexpr bool Quiets = Type == QUIETS || Type == EVASIONS;
+
+    const Color    us      = pos.side_to_move();
+    const Color    them    = ~us;
+    const Bitboard zombies = pos.zombies();
+    const Bitboard occ     = pos.blockers();
+    const Bitboard enemies = pos.pieces(them) & ~zombies & ~pos.pieces(KING);
+    const Bitboard emptySq = ~occ;
+    const Bitboard target  = (Caps ? enemies : Bitboard(0)) | (Quiets ? emptySq : Bitboard(0));
+
+    // Pawns
+    const Direction up     = pawn_push(us);
+    const Bitboard  rank8  = us == WHITE ? Rank8BB : Rank1BB;
+    const Bitboard  rank3  = us == WHITE ? Rank3BB : Rank6BB;
+    const Bitboard  pawns  = pos.pieces(us, PAWN) & ~zombies;
+
+    auto promotions = [&](Square from, Square to, bool capture) {
+        if (Caps)
+            *moveList++ = Move::make<PROMOTION>(from, to, QUEEN);
+        if ((Type == CAPTURES && capture) || (Type == QUIETS && !capture) || Type == EVASIONS)
+            for (PieceType pt : {ROOK, BISHOP, KNIGHT})
+                *moveList++ = Move::make<PROMOTION>(from, to, pt);
+    };
+
+    const Bitboard push1 = shift(pawns, up) & emptySq;
+    const Bitboard push2 = shift(push1 & rank3, up) & emptySq;
+
+    for (Bitboard b = push1; b;)
+    {
+        const Square to = pop_lsb(b);
+        if (rank8 & to)
+            promotions(to - up, to, false);
+        else if (Quiets)
+            *moveList++ = Move(to - up, to);
+    }
+    if (Quiets)
+        for (Bitboard b = push2; b;)
+        {
+            const Square to = pop_lsb(b);
+            *moveList++     = Move(to - up - up, to);
+        }
+
+    for (Bitboard b = pawns; b;)
+    {
+        const Square from = pop_lsb(b);
+        Bitboard     caps = Attacks::attacks_bb(PAWN, from, us) & enemies;
+        while (caps)
+        {
+            const Square to = pop_lsb(caps);
+            if (rank8 & to)
+                promotions(from, to, true);
+            else if (Caps)
+                *moveList++ = Move(from, to);
+        }
+    }
+
+    if (Caps && pos.ep_square() != SQ_NONE)
+        for (Bitboard b = Attacks::attacks_bb(PAWN, pos.ep_square(), them) & pawns; b;)
+            *moveList++ = Move::make<EN_PASSANT>(pop_lsb(b), pos.ep_square());
+
+    // Pieces
+    for (Bitboard b = pos.pieces(us) & ~zombies & ~pos.pieces(PAWN); b;)
+    {
+        const Square    from = pop_lsb(b);
+        const PieceType pt   = type_of(pos.piece_on(from));
+        moveList = splat_moves(moveList, from, Attacks::attacks_bb(pt, from, occ) & target);
+    }
+
+    // Castling as on the site: no piece between king and rook (the SCP does not
+    // count), the SCP not on the king's destination, no king square attacked.
+    const Square ksq = pos.square<KING>(us);
+    if (Quiets && !(zombies & ksq) && pos.can_castle(us & ANY_CASTLING) && !pos.scp049_attacked(ksq, them))
+        for (CastlingRights cr : {us & KING_SIDE, us & QUEEN_SIDE})
+        {
+            if (!pos.can_castle(cr) || (pos.pieces() & pos.castling_path(cr)))
+                continue;
+
+            const Square rsq = pos.castling_rook_square(cr);
+            const Square kto = relative_square(us, rsq > ksq ? SQ_G1 : SQ_C1);
+            const Square mid = relative_square(us, rsq > ksq ? SQ_F1 : SQ_D1);
+
+            if (!(pos.scp_bb() & kto) && !pos.scp049_attacked(mid, them)
+                && !pos.scp049_attacked(kto, them))
+                *moveList++ = Move::make<CASTLING>(ksq, rsq);
+        }
+
+    return moveList;
+}
+
 }  // namespace
 
 
@@ -294,6 +391,9 @@ Move* generate(const Position& pos, Move* moveList) {
 
     static_assert(Type != ALL, "Unsupported type in generate()");
     assert((Type == EVASIONS) == bool(pos.checkers()));
+
+    if (pos.scp_type() == SCP_049)
+        return generate_049<Type>(pos, moveList);
 
     Color us = pos.side_to_move();
 

@@ -111,6 +111,8 @@ class Engine {
     std::string                          fen() const;
     std::optional<PositionSetError>      flip();
     std::string                          visualize() const;
+    // Plays SCP-049's pending turn and returns the events
+    std::vector<std::string> scp049_phase(u64 seed);
     std::vector<std::pair<usize, usize>> get_bound_thread_count_by_numa_node() const;
     std::string                          get_numa_config_as_string() const;
     std::string                          numa_config_information_as_string() const;

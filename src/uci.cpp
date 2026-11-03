@@ -26,6 +26,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <string_view>
 #include <filesystem>
@@ -146,6 +147,16 @@ void UCIEngine::loop() {
             sync_cout << "readyok" << sync_endl;
 
         // Add custom non-UCI commands, mainly for debugging purposes.
+        else if (token == "scpphase")
+        {
+            // scpphase [seed]: plays SCP-049's pending turn
+            u64 seed = 0;
+            if (!(is >> seed) || !seed)
+                seed = std::random_device{}() * 6364136223846793005ULL ^ now();
+            for (const auto& e : engine.scp049_phase(seed))
+                sync_cout << "info string scp049 " << e << sync_endl;
+            sync_cout << "info string scp049 done" << sync_endl;
+        }
         else if (token == "flip")
         {
             if (auto err = engine.flip())
@@ -508,7 +519,7 @@ void UCIEngine::position(std::istringstream& is) {
 
     if (token == "startpos")
     {
-        fen = StartFEN;
+        fen = engine.get_options()["SCP"] == "049" ? StartFEN049 : StartFEN;
         is >> token;  // Consume the "moves" token, if any
     }
     else if (token == "fen")

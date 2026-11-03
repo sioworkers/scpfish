@@ -28,6 +28,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "attacks.h"
 #include "bitboard.h"
@@ -54,11 +55,13 @@ struct StateInfo {
     int    pliesFromNull;
     Square epSquare;
 
-    // SCP-096: square occupied by the SCP (empty bitboard if there is none) and
-    // the squares a king may not stand on (the SCP square plus every square a
-    // knight's move away from it).
+    // SCP square, and for SCP-096 the squares a king may not stand on (the SCP
+    // square and those a knight's move from it)
     Bitboard scpBB;
     Bitboard scpKingForbidden;
+
+    // SCP-049 zombies. They keep their color but cannot move or be captured.
+    Bitboard zombieBB;
 
     // Not copied when making a move (will be recomputed anyhow)
     Key        key;
@@ -70,16 +73,39 @@ struct StateInfo {
     Bitboard   threats[PIECE_TYPE_NB];
     Piece      capturedPiece;
     int        repetition;
-    int        scpOutcome;     // SCP_NONE, or game result for the side to move
+    int        scpOutcome;     // SCP_NONE or the game result for the side to move
     Piece      scpCaptured;    // piece taken by SCP-096 after this move, if any
-    Square     scpCapturedSq;  // and where it stood
+    Square     scpCapturedSq;  // and its square
+    bool       phasePending;   // SCP-049's turn is due
 };
 
-// Result of the SCP-096 acting on the board, from the side to move's view
+// Which SCP is on the board
+enum ScpType : u8 {
+    SCP_NONE_TYPE,
+    SCP_096,
+    SCP_049,
+};
+
+// Output of do_scp049_phase() in search mode
+struct ScpPhaseResult {
+    // Probability that a zombie captures each king, and that neither is captured
+    double pKingLoss[COLOR_NB] = {0, 0};
+    double survive             = 1;
+};
+
+// Board saved by do_scp049_phase() for undo
+struct ScpPhaseUndo {
+    std::array<Piece, SQUARE_NB>        board;
+    std::array<Bitboard, PIECE_TYPE_NB> byTypeBB;
+    std::array<Bitboard, COLOR_NB>      byColorBB;
+    std::array<int, PIECE_NB>           pieceCount;
+};
+
+// Game result decided by an SCP, from the side to move's point of view
 enum ScpOutcome : int {
     SCP_NONE = 0,
-    SCP_WIN  = 1,   // the opponent's king was taken (or can be taken right away)
-    SCP_LOSS = -1,  // our king was taken by the SCP
+    SCP_WIN  = 1,   // the enemy king was or can be captured
+    SCP_LOSS = -1,  // our king was captured
 };
 
 
@@ -114,7 +140,7 @@ class Position {
 
     // Position representation
     Bitboard pieces() const;    // All pieces
-    Bitboard blockers() const;  // All pieces plus the SCP-096 square
+    Bitboard blockers() const;  // All pieces plus the SCP square
     template<typename... PieceTypes>
     Bitboard pieces(PieceTypes... pts) const;
     Bitboard pieces(Color c) const;
@@ -135,6 +161,28 @@ class Position {
     bool   can_castle(CastlingRights cr) const;
     bool   castling_impeded(CastlingRights cr) const;
     Square castling_rook_square(CastlingRights cr) const;
+
+    // SCPs
+    ScpType  scp_type() const { return scpType; }
+    Bitboard zombies() const { return st->zombieBB; }
+    bool     phase_pending() const { return st->phasePending; }
+    bool     can_capture_king() const;
+    int      scp049_destinations(Square dests[4]) const;
+    void     do_scp049_phase(int                       dir,
+                             u64                       seed,
+                             bool                      searchMode,
+                             StateInfo&                newSt,
+                             ScpPhaseUndo&             undo,
+                             DirtyPiece&               dp,
+                             ScpPhaseResult&           res,
+                             std::vector<std::string>* events = nullptr);
+    void     undo_scp049_phase(const ScpPhaseUndo& undo);
+    // Skips SCP-049's turn (lookahead off)
+    void     skip_scp049_phase(StateInfo& newSt);
+    void     undo_skip_scp049_phase() { st = st->previous; }
+    Bitboard castling_path(CastlingRights cr) const { return castlingPath[cr]; }
+    bool     scp049_attacked(Square s, Color by) const;
+    Bitboard scp049_zombie_moves(Square from) const;
 
     // SCP-096
     Bitboard scp_bb() const;
@@ -238,6 +286,8 @@ class Position {
     Key adjust_key50(Key k) const;
     void set_scp(Square s);
     void scp_act(DirtyPiece& dp);
+    void scp049_after_change();
+    void scp049_check_info() const;
     void validate_ep_after_scp();
 
     // Data members
@@ -253,6 +303,7 @@ class Position {
     int        gamePly;
     Color      sideToMove;
     bool       chess960;
+    ScpType    scpType;
     Dirties    scratchDirties;
 };
 

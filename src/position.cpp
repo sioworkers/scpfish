@@ -53,6 +53,8 @@ Key castling[CASTLING_RIGHT_NB];
 Key side, noPawns;
 Key scp[SQUARE_NB];
 Key scpOutcome;
+Key zombie[SQUARE_NB];
+Key phasePending;
 
 }
 
@@ -89,7 +91,28 @@ std::ostream& operator<<(std::ostream& os, const Position& pos) {
         os << UCIEngine::square(pop_lsb(b)) << " ";
 
     if (pos.scp_bb())
-        os << "\nSCP-096: " << UCIEngine::square(pos.scp_square());
+        os << (pos.scp_type() == SCP_049 ? "\nSCP-049: " : "\nSCP-096: ")
+           << UCIEngine::square(pos.scp_square());
+
+    if (pos.scp_type() == SCP_049)
+    {
+        os << "\nZombies:";
+        for (Bitboard z = pos.zombies(); z;)
+        {
+            const Square s = pop_lsb(z);
+            os << " " << UCIEngine::square(s);
+        }
+        os << "\nZombie moves:";
+        for (Bitboard z = pos.zombies(); z;)
+        {
+            const Square s = pop_lsb(z);
+            os << " " << UCIEngine::square(s) << ":";
+            for (Bitboard t = pos.scp049_zombie_moves(s); t;)
+                os << UCIEngine::square(pop_lsb(t)) << (t ? "," : "");
+        }
+        if (pos.phase_pending())
+            os << "\nPhase pending: yes";
+    }
 
     if (Square t = pos.scp_victim(); t != SQ_NONE && !pos.scp_outcome())
         os << "\nSCP target: " << UCIEngine::square(t);
@@ -152,6 +175,10 @@ void Position::init() {
     for (Square s = SQ_A1; s <= SQ_H8; ++s)
         Zobrist::scp[s] = rng.rand<Key>();
     Zobrist::scpOutcome = rng.rand<Key>();
+
+    for (Square s = SQ_A1; s <= SQ_H8; ++s)
+        Zobrist::zombie[s] = rng.rand<Key>();
+    Zobrist::phasePending = rng.rand<Key>();
 
     // Prepare the cuckoo tables
     cuckoo.fill(0);
@@ -218,9 +245,11 @@ Position::set(const string& fenStr, bool isChess960, StateInfo* si) {
    6) Fullmove number. The number of the full move. It starts at 1, and is
       incremented after Black's move.
 
-   7) Optional SCP-096 field "scp:<square>", e.g. "scp:a4". SCP-096 occupies that
-      square: nothing may move onto or through it. Without this field there is
-      no SCP on the board and the position is played as regular chess.
+   7) Optional SCP fields. Without them there is no SCP on the board and the
+      position is played as regular chess.
+      - "scp:<square>", e.g. "scp:a4": SCP-096 occupies that square.
+      - "scp049:<square>", e.g. "scp049:b4": SCP-049 occupies that square, and
+        "zombies:<square>,<square>,..." lists the pieces it has turned into zombies.
 */
 
     unsigned char      token;
@@ -230,22 +259,45 @@ Position::set(const string& fenStr, bool isChess960, StateInfo* si) {
     std::memset(si, 0, sizeof(StateInfo));
     st = si;
 
-    // 7. SCP-096 field. It is looked up first because it affects the
-    // validation of the en passant square below.
+    // 7. SCP fields, parsed first as en passant validation depends on them
+    Bitboard zombieSquares = 0;
     {
         std::istringstream fields(fenStr);
         string             field;
         Square             scpSq = SQ_NONE;
 
-        while (fields >> field)
-            if (field.rfind("scp:", 0) == 0)
-            {
-                if (field.size() != 6 || field[4] < 'a' || field[4] > 'h' || field[5] < '1'
-                    || field[5] > '8')
-                    return PositionSetError("Invalid FEN. Invalid SCP-096 square: " + field);
+        auto parse_square = [](const string& str, usize i) {
+            return i + 1 < str.size() && str[i] >= 'a' && str[i] <= 'h' && str[i + 1] >= '1'
+                  && str[i + 1] <= '8'
+                   ? make_square(File(str[i] - 'a'), Rank(str[i + 1] - '1'))
+                   : SQ_NONE;
+        };
 
-                scpSq = make_square(File(field[4] - 'a'), Rank(field[5] - '1'));
+        while (fields >> field)
+        {
+            const bool is096 = field.rfind("scp:", 0) == 0;
+            const bool is049 = field.rfind("scp049:", 0) == 0;
+
+            if (is096 || is049)
+            {
+                const usize i = is096 ? 4 : 7;
+                scpSq         = parse_square(field, i);
+                if (scpSq == SQ_NONE || field.size() != i + 2)
+                    return PositionSetError("Invalid FEN. Invalid SCP square: " + field);
+                scpType = is096 ? SCP_096 : SCP_049;
             }
+            else if (field.rfind("zombies:", 0) == 0)
+                for (usize i = 8; i < field.size(); i += 3)
+                {
+                    const Square z = parse_square(field, i);
+                    if (z == SQ_NONE || (i + 2 < field.size() && field[i + 2] != ','))
+                        return PositionSetError("Invalid FEN. Invalid zombie list: " + field);
+                    zombieSquares |= z;
+                }
+        }
+
+        if (zombieSquares && scpType != SCP_049)
+            return PositionSetError("Invalid FEN. Zombies need SCP-049 on the board.");
 
         set_scp(scpSq);
     }
@@ -317,7 +369,12 @@ Position::set(const string& fenStr, bool isChess960, StateInfo* si) {
         return PositionSetError("Unsupported position. Incorrect number of kings.");
 
     if (pieces() & st->scpBB)
-        return PositionSetError("Invalid FEN. The SCP-096 square is occupied.");
+        return PositionSetError("Invalid FEN. The SCP square is occupied.");
+
+    if (zombieSquares & ~pieces())
+        return PositionSetError("Invalid FEN. A zombie square is empty.");
+
+    st->zombieBB = zombieSquares;
 
     for (Color c : {WHITE, BLACK})
     {
@@ -418,6 +475,12 @@ Position::set(const string& fenStr, bool isChess960, StateInfo* si) {
                                     + std::string(1, token));
         }
 
+        // SCP variants castle only with the king on e1 and the rook in its corner
+        if (scpType != SCP_NONE_TYPE && !isChess960 && (token == 'K' || token == 'Q')
+            && (ksq != relative_square(c, SQ_E1)
+                || rsq != relative_square(c, token == 'K' ? SQ_H1 : SQ_A1)))
+            rsq = SQ_NONE;
+
         // Only apply castling rights if they can be valid.
         if (ksq != SQ_NONE && rsq != SQ_NONE)
             set_castling_right(c, rsq);
@@ -449,6 +512,17 @@ Position::set(const string& fenStr, bool isChess960, StateInfo* si) {
                      && !(blockers() & (st->epSquare | (st->epSquare + pawn_push(sideToMove))))
                      && !(st->scpKingForbidden & square<KING>(sideToMove));
 
+            // SCP-049 has no pins, and zombie pawns take no part in en passant
+            if (scpType == SCP_049)
+            {
+                // A zombie may have moved behind the en passant square
+                pawns &= ~st->zombieBB;
+                enpassant = pawns && target && !(target & st->zombieBB)
+                         && !(blockers() & st->epSquare);
+                legalEP   = true;
+                pawns     = 0;
+            }
+
             // If no pawn can execute the en passant capture without leaving the king in check, don't record the epSquare
             while (pawns)
                 legalEP |= !(attackers_to(square<KING>(sideToMove), occ ^ pop_lsb(pawns))
@@ -479,7 +553,8 @@ Position::set(const string& fenStr, bool isChess960, StateInfo* si) {
     chess960 = isChess960;
     set_state();
 
-    if (attackers_to(square<KING>(~sideToMove)) & pieces(sideToMove))
+    // Under SCP-049 a capturable king is legal: the side to move has won
+    if (scpType != SCP_049 && (attackers_to(square<KING>(~sideToMove)) & pieces(sideToMove)))
         return PositionSetError("Unsupported position. King can be captured.");
 
     assert(pos_is_ok());
@@ -524,6 +599,11 @@ void Position::set_extra_bitboards() const {
     st->checkSquares[QUEEN]  = st->checkSquares[BISHOP] | st->checkSquares[ROOK];
     st->checkSquares[KING]   = 0;
 
+    // A zombie king cannot be checked
+    if (st->zombieBB & ksq)
+        for (PieceType pt = PAWN; pt <= KING; ++pt)
+            st->checkSquares[pt] = 0;
+
     st->threats[ALL_PIECES] = 0;
 }
 
@@ -554,14 +634,23 @@ void Position::set_state() const {
     st->nonPawnMaterial[WHITE] = st->nonPawnMaterial[BLACK] = VALUE_ZERO;
     st->checkersBB = attackers_to(square<KING>(sideToMove)) & pieces(~sideToMove);
 
-    // A king a knight's move away from SCP-096 is in check by the SCP
+    // A king a knight's move from SCP-096 is in check
     if (st->scpKingForbidden & square<KING>(sideToMove))
         st->checkersBB |= st->scpBB;
 
     if (st->scpBB)
         st->key ^= Zobrist::scp[lsb(st->scpBB)];
 
+    for (Bitboard z = st->zombieBB; z;)
+        st->key ^= Zobrist::zombie[pop_lsb(z)];
+
+    if (st->phasePending)
+        st->key ^= Zobrist::phasePending;
+
     set_extra_bitboards();
+
+    if (scpType == SCP_049)
+        scp049_check_info();
 
     for (Bitboard b = pieces(); b;)
     {
@@ -673,7 +762,14 @@ string Position::fen() const {
        << st->rule50 << " " << 1 + (gamePly - (sideToMove == BLACK)) / 2;
 
     if (st->scpBB)
-        ss << " scp:" << UCIEngine::square(scp_square());
+        ss << (scpType == SCP_049 ? " scp049:" : " scp:") << UCIEngine::square(scp_square());
+
+    if (st->zombieBB)
+    {
+        ss << " zombies:";
+        for (Bitboard z = st->zombieBB; z;)
+            ss << UCIEngine::square(pop_lsb(z)) << (z ? "," : "");
+    }
 
     return ss.str();
 }
@@ -689,10 +785,14 @@ void Position::update_slider_blockers(Color c) const {
     st->pinners[~c]        = 0;
 
     // Snipers are sliders that attack 's' when a piece and other snipers are removed
+    // Zombies do not capture, and a zombie king cannot be captured
+    if (st->zombieBB & ksq)
+        return;
+
     Bitboard snipers = ((attacks_bb(ROOK, ksq) & pieces(QUEEN, ROOK))
                         | (attacks_bb(BISHOP, ksq) & pieces(QUEEN, BISHOP)))
-                     & pieces(~c);
-    Bitboard occupancy = blockers() ^ snipers;  // SCP-096 blocks lines
+                     & pieces(~c) & ~st->zombieBB;
+    Bitboard occupancy = blockers() ^ snipers;  // the SCP blocks lines
 
     while (snipers)
     {
@@ -730,8 +830,8 @@ bool Position::legal(Move m) const {
     Square to   = m.to_sq();
     Piece  pc   = moved_piece(m);
 
-    // Use a slower but simpler function for uncommon cases
-    if (m.type_of() != NORMAL)
+    // Use a slower but simpler function for uncommon cases and for SCP-049
+    if (m.type_of() != NORMAL || scpType == SCP_049)
         return MoveList<ALL>(*this).contains(m);
 
     // Is not a promotion, so the promotion piece must be empty
@@ -742,7 +842,7 @@ bool Position::legal(Move m) const {
     if (pc == NO_PIECE || color_of(pc) != us)
         return false;
 
-    // The destination square cannot be occupied by a friendly piece or SCP-096
+    // The destination square cannot hold a friendly piece or an SCP
     if ((pieces(us) | st->scpBB) & to)
         return false;
 
@@ -894,6 +994,13 @@ void Position::do_move(
         Square rfrom, rto;
         do_castling<true>(us, from, to, rfrom, rto, &dts, &dp);
 
+        // Castling with a zombie rook turns it back into a normal piece
+        if (st->zombieBB & rfrom)
+        {
+            st->zombieBB ^= rfrom;
+            k ^= Zobrist::zombie[rfrom];
+        }
+
         k ^= Zobrist::psq[captured][rfrom] ^ Zobrist::psq[captured][rto];
         st->nonPawnKey[us] ^= Zobrist::psq[captured][rfrom] ^ Zobrist::psq[captured][rto];
         captured = NO_PIECE;
@@ -970,7 +1077,7 @@ void Position::do_move(
             Bitboard pawns    = attacks_bb(PAWN, epSquare, us) & pieces(them, PAWN);
 
             // If there are no pawns attacking the ep square, ep is not possible.
-            // Neither is it when the king is in check by SCP-096: only a king move helps.
+            // Nor with the king in check by SCP-096.
             if (pawns && !(st->scpKingForbidden & pieces(them, KING)))
             {
                 Square   ksq         = square<KING>(them);
@@ -980,7 +1087,9 @@ void Position::do_move(
                 // If the pawn gives discovered check, ep is never legal. Else, if at least one
                 // pawn was not a blocker for the enemy king or lies on the same line as the
                 // enemy king and en passant square, a legal capture exists.
-                if (noDiscovery && (pawns & (notBlockers | line_bb(epSquare, ksq))))
+                // Under SCP-049 any non-zombie pawn may capture
+                if (scpType == SCP_049 ? bool(pawns & ~st->zombieBB)
+                                       : noDiscovery && (pawns & (notBlockers | line_bb(epSquare, ksq))))
                 {
                     st->epSquare = epSquare;
                     k ^= Zobrist::enpassant[file_of(epSquare)];
@@ -1076,11 +1185,23 @@ void Position::do_move(
     // Update king attacks used for fast check detection
     set_extra_bitboards();
 
-    // SCP-096 acts once per full round, right after Black has moved
-    st->scpOutcome  = SCP_NONE;
-    st->scpCaptured = NO_PIECE;
-    if (us == BLACK && st->scpBB)
+    // Both SCPs act after Black's move
+    st->scpOutcome   = SCP_NONE;
+    st->scpCaptured  = NO_PIECE;
+    st->phasePending = false;
+    if (us == BLACK && scpType == SCP_096)
         scp_act(dp);
+
+    // SCP-049's turn is random and is played separately by do_scp049_phase()
+    if (scpType == SCP_049)
+    {
+        if (us == BLACK)
+        {
+            st->phasePending = true;
+            st->key ^= Zobrist::phasePending;
+        }
+        scp049_check_info();
+    }
 
     // Calculate the repetition info. It is the ply distance from the previous
     // occurrence of the same position, negative in the 3-fold case, or zero
@@ -1121,7 +1242,7 @@ void Position::undo_move(Move m) {
 
     sideToMove = ~sideToMove;
 
-    // Give back the piece taken by SCP-096 first: it may be the piece that moved
+    // Restore the piece SCP-096 took first, as it may be the one that moved
     if (st->scpCaptured)
         put_piece(st->scpCaptured, st->scpCapturedSq);
 
@@ -1400,6 +1521,7 @@ void Position::do_null_move(StateInfo& newSt) {
     st->capturedPiece = NO_PIECE;
     st->scpCaptured   = NO_PIECE;
     st->scpOutcome    = SCP_NONE;
+    st->phasePending  = false;
 
     sideToMove = ~sideToMove;
 
@@ -1454,7 +1576,7 @@ bool Position::see_ge(Move m, int threshold) const {
     while (true)
     {
         stm = ~stm;
-        attackers &= occupied;
+        attackers &= occupied & ~st->zombieBB;  // zombies do not capture
 
         // If stm has no more attackers then give up: stm loses
         if (!(stmAttackers = attackers & pieces(stm)))
@@ -1533,6 +1655,10 @@ bool Position::see_ge(Move m, int threshold) const {
 // or by repetition. It does not detect stalemates.
 bool Position::is_draw(int ply) const {
 
+    // SCP-049 has no draws
+    if (scpType == SCP_049)
+        return false;
+
     if (st->rule50 > 99 && (!checkers() || MoveList<ALL>(*this).size()))
         return true;
 
@@ -1563,6 +1689,9 @@ bool Position::has_repeated() const {
 // Tests if the position has a move which draws by repetition.
 // This function accurately matches the outcome of is_draw() over all legal moves.
 bool Position::upcoming_repetition(int ply) const {
+
+    if (scpType == SCP_049)
+        return false;
 
     int end = std::min(st->rule50, st->pliesFromNull);
 
@@ -1606,20 +1735,19 @@ bool Position::upcoming_repetition(int ply) const {
 }
 
 
-// Places SCP-096 on square s (SQ_NONE removes it). Does not touch the hash key.
+// Places the SCP on s (SQ_NONE removes it). The hash key is not updated.
 void Position::set_scp(Square s) {
     st->scpBB            = s == SQ_NONE ? 0 : square_bb(s);
-    st->scpKingForbidden = s == SQ_NONE ? 0 : square_bb(s) | attacks_bb(KNIGHT, s);
+    st->scpKingForbidden =
+      s == SQ_NONE || scpType != SCP_096 ? 0 : square_bb(s) | attacks_bb(KNIGHT, s);
 }
 
 
-// Returns the square of the piece SCP-096 would take now, or SQ_NONE. Every piece
-// of either color that attacks the SCP square is a candidate (only real pieces
-// block lines). The closest one by Euclidean distance is taken; ties go to the
-// piece on the higher rank, then to the one on the lower file.
+// Returns the square of the piece SCP-096 would capture, or SQ_NONE: the attacker
+// closest by Euclidean distance, ties broken by higher rank, then lower file.
 Square Position::scp_victim() const {
 
-    if (!st->scpBB)
+    if (!st->scpBB || scpType != SCP_096)
         return SQ_NONE;
 
     const Square s         = lsb(st->scpBB);
@@ -1642,8 +1770,8 @@ Square Position::scp_victim() const {
 }
 
 
-// SCP-096's turn, played inside do_move() after Black's move with White to move.
-// If some piece attacks the SCP, the SCP takes it and moves onto its square.
+// SCP-096's turn, played by do_move() after Black's move: the SCP captures the
+// nearest piece attacking it and moves to its square.
 void Position::scp_act(DirtyPiece& dp) {
 
     assert(sideToMove == WHITE);
@@ -1653,9 +1781,7 @@ void Position::scp_act(DirtyPiece& dp) {
     if (victimSq == SQ_NONE)
         return;
 
-    // Checkmate and stalemate are decided before the SCP acts: if White has no
-    // legal move the game is already over, so leave the board untouched and let
-    // the search see the mate or stalemate.
+    // Mate and stalemate are decided before the SCP acts
     if (!MoveList<ALL>(*this).size())
         return;
 
@@ -1664,8 +1790,7 @@ void Position::scp_act(DirtyPiece& dp) {
 
     if (type_of(victim) == KING)
     {
-        // Game over. The king stays on the board so the position remains
-        // well formed; the search scores the node from scp_outcome().
+        // The king stays on the board; search scores the node via scp_outcome()
         st->scpOutcome = vc == sideToMove ? SCP_LOSS : SCP_WIN;
         st->key ^= Zobrist::scpOutcome;
         return;
@@ -1701,10 +1826,10 @@ void Position::scp_act(DirtyPiece& dp) {
 
     st->key = k;
 
-    // NNUE does not get a diff for this capture: force an accumulator refresh
+    // No NNUE diff for this capture: force a refresh
     dp.scpCapture = true;
 
-    // Lines opened or closed by the SCP: recompute all check information
+    // The SCP may have opened or closed lines
     const Square ksq = square<KING>(sideToMove);
     st->checkersBB   = attackers_to(ksq) & pieces(~sideToMove);
     if (st->scpKingForbidden & ksq)
@@ -1713,7 +1838,7 @@ void Position::scp_act(DirtyPiece& dp) {
     set_extra_bitboards();
     validate_ep_after_scp();
 
-    // The SCP may have exposed Black's king to White: White just takes it
+    // White can capture an exposed Black king
     if (attackers_to(square<KING>(~sideToMove)) & pieces(sideToMove))
     {
         st->scpOutcome = SCP_WIN;
@@ -1722,7 +1847,7 @@ void Position::scp_act(DirtyPiece& dp) {
 }
 
 
-// After SCP-096 took a piece, an en passant capture may no longer be legal
+// Drops the en passant square if SCP-096's capture made it illegal
 void Position::validate_ep_after_scp() {
 
     if (st->epSquare == SQ_NONE)
@@ -1745,6 +1870,295 @@ void Position::validate_ep_after_scp() {
         st->key ^= Zobrist::enpassant[file_of(epSq)];
         st->epSquare = SQ_NONE;
     }
+}
+
+
+// SCP-049 (iwantcheckmate.com/challenges/scp-049). There is no check and a game
+// ends when a king is captured. After each Black move the SCP steps to a random
+// empty orthogonally adjacent square and turns the pieces around it into zombies,
+// then each older zombie makes a random move. Zombies cannot be moved or captured,
+// and capture any piece except zombies and the king of their own color.
+
+// Returns true if the side to move can capture the enemy king
+bool Position::can_capture_king() const {
+
+    const Square ksq = square<KING>(~sideToMove);
+
+    return !(st->zombieBB & ksq)
+        && (attackers_to(ksq, blockers()) & pieces(sideToMove) & ~st->zombieBB);
+}
+
+
+// Sets the checkers (enemy pieces able to capture our king, which search treats
+// as a check) and the outcome when the side to move can capture the enemy king.
+void Position::scp049_check_info() const {
+
+    const Square ksq = square<KING>(sideToMove);
+
+    st->checkersBB = (st->zombieBB & ksq)
+                     ? 0
+                     : attackers_to(ksq, blockers()) & pieces(~sideToMove) & ~st->zombieBB;
+
+    // Undecided while the SCP still has to act: it may zombify the attacker
+    if (!st->phasePending && can_capture_king())
+    {
+        st->scpOutcome = SCP_WIN;
+        st->key ^= Zobrist::scpOutcome;
+    }
+}
+
+
+// The site's attack test, used only for castling: the SCP does not block lines,
+// and for White attacks every zombie counts, zombie pawns in both directions.
+bool Position::scp049_attacked(Square s, Color by) const {
+
+    const Bitboard occ     = pieces();
+    const Bitboard zombies = by == WHITE ? st->zombieBB : Bitboard(0);
+    const Bitboard real    = pieces(by) & ~st->zombieBB;
+    const Bitboard att     = real | zombies;
+
+    const auto [bishopAttacks, rookAttacks] = both_attacks_bb(s, occ);
+
+    return (rookAttacks & att & pieces(ROOK, QUEEN)) | (bishopAttacks & att & pieces(BISHOP, QUEEN))
+         | (attacks_bb(KNIGHT, s) & att & pieces(KNIGHT)) | (attacks_bb(KING, s) & att & pieces(KING))
+         | (attacks_bb(PAWN, s, ~by) & real & pieces(PAWN))
+         | ((attacks_bb(PAWN, s, WHITE) | attacks_bb(PAWN, s, BLACK)) & zombies & pieces(PAWN));
+}
+
+
+// Empty squares SCP-049 may step to, in the site's order: up, right, down, left
+int Position::scp049_destinations(Square dests[4]) const {
+
+    const Square s = lsb(st->scpBB);
+    int          n = 0;
+
+    const bool canUp = rank_of(s) < RANK_8, canDown = rank_of(s) > RANK_1;
+    const bool canRight = file_of(s) < FILE_H, canLeft = file_of(s) > FILE_A;
+
+    for (auto [ok, d] : {std::pair{canUp, NORTH}, std::pair{canRight, EAST},
+                         std::pair{canDown, SOUTH}, std::pair{canLeft, WEST}})
+        if (ok && empty(s + d))
+            dests[n++] = s + d;
+
+    return n;
+}
+
+
+// Returns the squares the zombie on 'from' may move to
+Bitboard Position::scp049_zombie_moves(Square from) const {
+
+    const Piece    pc       = piece_on(from);
+    const Color    c        = color_of(pc);
+    const Bitboard occ      = pieces() | st->scpBB;
+    const Bitboard allowed  = ~st->scpBB & ~st->zombieBB & ~pieces(c, KING);
+    Bitboard       targets  = 0;
+
+    switch (type_of(pc))
+    {
+    case PAWN : {
+        // Zombie pawns move and capture in both directions
+        for (Direction d : {NORTH, SOUTH})
+        {
+            if ((d == NORTH && rank_of(from) == RANK_8) || (d == SOUTH && rank_of(from) == RANK_1))
+                continue;
+            if (!(occ & (from + d)))
+                targets |= from + d;
+        }
+        targets |= (attacks_bb(PAWN, from, WHITE) | attacks_bb(PAWN, from, BLACK)) & pieces();
+        break;
+    }
+    case KNIGHT :
+    case KING :
+        targets = attacks_bb(type_of(pc), from);
+        break;
+    default :
+        targets = attacks_bb(type_of(pc), from, occ);
+    }
+
+    return targets & allowed;
+}
+
+
+// Plays SCP-049's turn. 'dir' indexes scp049_destinations(), -1 picks at random.
+// In search mode zombies never capture a king: the probability that one would is
+// added to 'res' and a non-capturing move is drawn instead.
+void Position::do_scp049_phase(int                       dir,
+                               u64                       seed,
+                               bool                      searchMode,
+                               StateInfo&                newSt,
+                               ScpPhaseUndo&             undo,
+                               DirtyPiece&               dp,
+                               ScpPhaseResult&           res,
+                               std::vector<std::string>* events) {
+
+    assert(scpType == SCP_049 && st->phasePending && sideToMove == WHITE);
+
+    std::memcpy(&newSt, st, sizeof(StateInfo));
+    newSt.previous = st;
+    st             = &newSt;
+
+    st->phasePending = false;
+    st->scpOutcome   = SCP_NONE;
+    st->scpCaptured  = NO_PIECE;
+
+    std::copy(std::begin(board), std::end(board), undo.board.begin());
+    undo.byTypeBB  = byTypeBB;
+    undo.byColorBB = byColorBB;
+    std::copy(std::begin(pieceCount), std::end(pieceCount), undo.pieceCount.begin());
+
+    // Force an accumulator refresh
+    dp            = DirtyPiece{};
+    dp.pc         = NO_PIECE;
+    dp.from = dp.to = dp.remove_sq = dp.add_sq = SQ_NONE;
+    dp.scpCapture = true;
+
+    PRNG rng(seed | 1);
+    auto say = [&](const std::string& e) {
+        if (events)
+            events->push_back(e);
+    };
+    auto sq = [](Square s) { return UCIEngine::square(s); };
+
+    // 1. Step
+    Square dests[4];
+    if (const int n = scp049_destinations(dests))
+    {
+        const Square from = lsb(st->scpBB);
+        const Square to   = dests[dir >= 0 && dir < n ? dir : int(rng.rand<u64>() % u64(n))];
+        set_scp(to);
+        say("move " + sq(from) + " " + sq(to));
+    }
+
+    // 2. Zombify the adjacent pieces
+    const Bitboard oldZombies = st->zombieBB;
+    const Bitboard cured      = attacks_bb(KING, lsb(st->scpBB)) & pieces() & ~st->zombieBB;
+    st->zombieBB |= cured;
+    for (Bitboard b = cured; b;)
+        say("zombify " + sq(pop_lsb(b)));
+
+    // 3. Older zombies move
+    Color kingTaken = COLOR_NB;
+    for (Bitboard movers = oldZombies; movers && res.survive > 0;)
+    {
+        const Square from    = pop_lsb(movers);
+        Bitboard     targets = scp049_zombie_moves(from);
+
+        if (!targets)
+            continue;
+
+        int n = popcount(targets);
+
+        if (searchMode)
+        {
+            if (const Bitboard k = targets & pieces(KING))
+            {
+                // Only the king of the other color can be a target
+                const double p = res.survive * popcount(k) / n;
+                res.pKingLoss[color_of(piece_on(lsb(k)))] += p;
+                res.survive -= p;
+                targets &= ~k;
+                n -= popcount(k);
+                if (!n)
+                {
+                    res.survive = 0;  // every move captures a king
+                    break;
+                }
+            }
+        }
+
+        // Select the i-th target
+        int i = int(rng.rand<u64>() % u64(n));
+        while (i--)
+            targets &= targets - 1;
+        const Square to = lsb(targets);
+
+        const Piece pc       = piece_on(from);
+        const Piece captured = piece_on(to);
+
+        if (type_of(captured) == KING)
+        {
+            kingTaken = color_of(captured);
+            say("zombie " + sq(from) + " " + sq(to) + " king");
+            break;
+        }
+
+        if (captured)
+            remove_piece(to);
+
+        move_piece(from, to);
+        st->zombieBB ^= from | to;
+        st->castlingRights &= ~(castlingRightsMask[from] | castlingRightsMask[to]);
+
+        // Zombie pawns promote to a queen on either back rank
+        const bool promotes = type_of(pc) == PAWN && (rank_of(to) == RANK_1 || rank_of(to) == RANK_8);
+        if (promotes)
+        {
+            remove_piece(to);
+            put_piece(make_piece(color_of(pc), QUEEN), to);
+        }
+
+        say("zombie " + sq(from) + " " + sq(to) + (captured ? " x" : "") + (promotes ? " =q" : ""));
+    }
+
+    if (searchMode && res.survive <= 0)
+        res.survive = 0;
+
+    scp049_after_change();
+
+    // Outside search, a zombie captured a king
+    if (kingTaken != COLOR_NB)
+    {
+        st->scpOutcome = kingTaken == sideToMove ? SCP_LOSS : SCP_WIN;
+        st->key ^= Zobrist::scpOutcome;
+    }
+}
+
+
+void Position::skip_scp049_phase(StateInfo& newSt) {
+
+    assert(scpType == SCP_049 && st->phasePending);
+
+    std::memcpy(&newSt, st, sizeof(StateInfo));
+    newSt.previous = st;
+    st             = &newSt;
+
+    st->phasePending = false;
+    st->key ^= Zobrist::phasePending;
+    scp049_check_info();
+}
+
+
+void Position::undo_scp049_phase(const ScpPhaseUndo& undo) {
+
+    std::copy(undo.board.begin(), undo.board.end(), std::begin(board));
+    byTypeBB  = undo.byTypeBB;
+    byColorBB = undo.byColorBB;
+    std::copy(undo.pieceCount.begin(), undo.pieceCount.end(), std::begin(pieceCount));
+
+    st = st->previous;
+}
+
+
+// Recomputes keys, material and check info after SCP-049's turn
+void Position::scp049_after_change() {
+
+    // Drop en passant if the pawn was captured or zombified, or the square taken
+    if (Square ep = st->epSquare; ep != SQ_NONE)
+    {
+        const Bitboard target = pieces(~sideToMove, PAWN) & ~st->zombieBB & (ep - pawn_push(sideToMove));
+        const Bitboard pawns  = attacks_bb(PAWN, ep, ~sideToMove) & pieces(sideToMove, PAWN) & ~st->zombieBB;
+        if (!target || !pawns || !empty(ep) || (st->scpBB & ep))
+            st->epSquare = SQ_NONE;
+    }
+
+    const int        rule50     = st->rule50;
+    const Bitboard   zombieBB   = st->zombieBB;
+    const Bitboard   scpBB      = st->scpBB;
+
+    set_state();
+
+    assert(st->rule50 == rule50 && st->zombieBB == zombieBB && st->scpBB == scpBB);
+    (void) rule50, (void) zombieBB, (void) scpBB;
 }
 
 
@@ -1776,9 +2190,12 @@ std::optional<PositionSetError> Position::flip() {
     ss >> token;  // En passant square
     f += (token == "-" ? token : token.replace(1, 1, token[1] == '3' ? "6" : "3"));
 
-    std::getline(ss, token);  // Half and full moves, SCP-096 square
-    if (auto i = token.find("scp:"); i != string::npos && i + 5 < token.size())
-        token[i + 5] = char('1' + '8' - token[i + 5]);
+    std::getline(ss, token);  // Half and full moves, SCP fields
+    if (auto i = token.find("scp"); i != string::npos)
+        for (usize j = i; j < token.size(); ++j)  // flip SCP and zombie ranks
+            if (token[j] >= '1' && token[j] <= '8' && j > 0 && token[j - 1] >= 'a'
+                && token[j - 1] <= 'h')
+                token[j] = char('1' + '8' - token[j]);
     f += token;
 
     return set(f, is_chess960(), st);
@@ -1799,7 +2216,8 @@ bool Position::pos_is_ok() const {
         assert(0 && "pos_is_ok: Default");
 
     if (count<KING>(WHITE) != 1 || count<KING>(BLACK) != 1
-        || (!st->scpOutcome && (attackers_to(square<KING>(~sideToMove)) & pieces(sideToMove))))
+        || (!st->scpOutcome && scpType != SCP_049
+            && (attackers_to(square<KING>(~sideToMove)) & pieces(sideToMove))))
         assert(0 && "pos_is_ok: Kings");
 
     if (pieces() & st->scpBB)
@@ -1809,7 +2227,13 @@ bool Position::pos_is_ok() const {
         assert(0 && "pos_is_ok: Pawns");
 
 
-    if (ep_square() != SQ_NONE)
+    if (ep_square() != SQ_NONE && scpType == SCP_049)
+    {
+        if (!((ep_square() + pawn_push(~sideToMove)) & pieces(~sideToMove, PAWN) & ~st->zombieBB)
+            || !(attacks_bb(PAWN, ep_square(), ~sideToMove) & pieces(sideToMove, PAWN) & ~st->zombieBB))
+            assert(0 && "pos_is_ok: En passant square (SCP-049)");
+    }
+    else if (ep_square() != SQ_NONE)
     {
         Square ksq = square<KING>(sideToMove);
 

@@ -92,6 +92,18 @@ Engine::Engine(std::optional<std::filesystem::path> path) :
           return std::nullopt;
       }));
 
+    // SCP placed by "position startpos"
+    options.add("SCP", Option("096 var 096 var 049", "096"));
+
+    // SCP-049 chance nodes: -100 scores the worst outcome, 0 the average, 100 the best
+    options.add("SCP Risk", Option(0, -100, 100));
+
+    // Zombie-move samples per SCP-049 step
+    options.add("SCP Samples", Option(1, 1, 16));
+
+    // When false, the search ignores SCP-049's turn
+    options.add("SCP-049 Lookahead", Option(true));
+
     options.add(  //
       "Clear Hash", Option([this](const Option&) {
           search_clear();
@@ -321,6 +333,20 @@ OptionsMap&       Engine::get_options() { return options; }
 std::string Engine::fen() const { return pos.fen(); }
 
 std::optional<PositionSetError> Engine::flip() { return pos.flip(); }
+
+std::vector<std::string> Engine::scp049_phase(u64 seed) {
+    std::vector<std::string> events;
+
+    if (pos.scp_type() != SCP_049 || !pos.phase_pending())
+        return events;
+
+    ScpPhaseUndo   undo;
+    ScpPhaseResult res;
+    DirtyPiece     dp;
+    states->emplace_back();
+    pos.do_scp049_phase(-1, seed, false, states->back(), undo, dp, res, &events);
+    return events;
+}
 
 std::string Engine::visualize() const {
     std::stringstream ss;
